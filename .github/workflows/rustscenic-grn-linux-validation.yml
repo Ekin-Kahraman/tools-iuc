@@ -1,0 +1,151 @@
+name: RustScenic GRN native Linux validation
+
+on:
+  push:
+    branches: [validation/rustscenic-grn-linux-20261028]
+    paths:
+      - .github/workflows/rustscenic-grn-linux-validation.yml
+      - .github/scripts/rustscenic_grn_validation.py
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rustscenic-grn-linux-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  planemo:
+    if: github.repository == 'Ekin-Kahraman/tools-iuc'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      GALAXY_SKIP_CLIENT_BUILD: '1'
+      CONDA_CHANNEL_PRIORITY: strict
+    steps:
+      - name: Checkout reviewed wrapper and validation code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            tools/rustscenic
+            .github/scripts/rustscenic_grn_validation.py
+            .github/workflows/rustscenic-grn-linux-validation.yml
+      - name: Checkout pinned Galaxy release 26.1 source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: galaxyproject/galaxy
+          ref: 04fe1e82c16e3c3f7ab51ba50912d945cd9b0c36
+          path: _galaxy
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Set up Python for Planemo and Galaxy, separate from the tool dependency
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+      - name: Verify exact reviewed source and synthetic fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p validation-artifacts/{slots2,slots1}
+          python .github/scripts/rustscenic_grn_validation.py preflight --phase before --artifact validation-artifacts
+          test "$(git -C _galaxy rev-parse HEAD)" = 04fe1e82c16e3c3f7ab51ba50912d945cd9b0c36
+      - name: Install pinned Planemo and prepare only conda-forge and Bioconda resolution
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m venv "$RUNNER_TEMP/planemo"
+          "$RUNNER_TEMP/planemo/bin/python" -m pip install 'planemo==0.75.47' 'galaxy-tool-util==26.1.2'
+          echo "$RUNNER_TEMP/planemo/bin" >> "$GITHUB_PATH"
+          test -x "$CONDA/bin/conda"
+          if [ ! -e "$HOME/miniforge3" ]; then ln -s "$CONDA" "$HOME/miniforge3"; fi
+          test "$(readlink -f "$HOME/miniforge3")" = "$(readlink -f "$CONDA")"
+          "$CONDA/bin/conda" install --yes --prefix "$CONDA" --override-channels --strict-channel-priority --channel conda-forge conda-build
+          "$RUNNER_TEMP/planemo/bin/planemo" test --help > validation-artifacts/planemo-test-help.txt
+          "$RUNNER_TEMP/planemo/bin/planemo" lint --help > validation-artifacts/planemo-lint-help.txt
+      - name: Lint wrapper with real Conda requirement availability checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          planemo lint --conda_requirements tools/rustscenic/rustscenic_grn.xml 2>&1 | tee validation-artifacts/lint.log
+      - name: Run six actual Galaxy tests and the planned one-slot baseline comparison
+        shell: bash
+        run: |
+          set -euo pipefail
+          for slots in 2 1; do
+            run_dir="$RUNNER_TEMP/rustscenic-galaxy-validation/slots$slots"
+            mkdir -p "$run_dir/tmp" "$run_dir/objects"
+            cat > "$run_dir/jobs.yml" <<EOF
+          runners:
+            local:
+              load: galaxy.jobs.runners.local:LocalJobRunner
+              workers: 1
+          execution:
+            default: local
+            environments:
+              local:
+                runner: local
+                local_slots: $slots
+          EOF
+            selection=()
+            if [ "$slots" = 1 ]; then selection=(--test_index 1); fi
+            TMPDIR="$run_dir/tmp" planemo test \
+              --engine galaxy \
+              --galaxy_root "$GITHUB_WORKSPACE/_galaxy" \
+              --galaxy_python_version 3.11 \
+              --database_type sqlite \
+              --conda_dependency_resolution \
+              --conda_exec "$CONDA/bin/conda" \
+              --conda_prefix "$CONDA" \
+              --conda_channels conda-forge,bioconda \
+              --no_conda_auto_init \
+              --job_config_file "$run_dir/jobs.yml" \
+              --file_path "$run_dir/objects" \
+              --no_cleanup \
+              --galaxy_startup_timeout 1200 \
+              --test_timeout 600 \
+              --summary compact \
+              --test_output "validation-artifacts/slots$slots/galaxy-tests.html" \
+              --test_output_json "validation-artifacts/slots$slots/galaxy-tests.json" \
+              --test_output_xunit "validation-artifacts/slots$slots/galaxy-tests.xml" \
+              "${selection[@]}" tools/rustscenic/rustscenic_grn.xml \
+              2>&1 | tee "validation-artifacts/slots$slots/planemo-test.log"
+          done
+      - name: Recheck reviewed source and fixture integrity after execution
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C _galaxy rev-parse HEAD)" = 04fe1e82c16e3c3f7ab51ba50912d945cd9b0c36
+          python .github/scripts/rustscenic_grn_validation.py preflight --phase after --artifact validation-artifacts
+      - name: Preserve only synthetic datasets and relevant reviewed job scripts
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/planemo/bin/python" .github/scripts/rustscenic_grn_validation.py collect \
+            --artifact validation-artifacts --workspace "$RUNNER_TEMP/rustscenic-galaxy-validation"
+      - name: Verify actual test totals, outputs, provenance and resource parity
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          python .github/scripts/rustscenic_grn_validation.py audit --artifact validation-artifacts
+      - name: Scan actual whitelisted text artifacts before upload
+        id: artifact_scan
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          python .github/scripts/rustscenic_grn_validation.py scan --artifact validation-artifacts
+      - name: Upload whitelisted validation evidence
+        if: always() && steps.artifact_scan.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rustscenic-grn-native-linux-${{ github.run_id }}
+          path: validation-artifacts
+          if-no-files-found: error
+          retention-days: 7
